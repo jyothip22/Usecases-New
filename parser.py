@@ -1,3 +1,14 @@
+/*Your updated parser.py returns a dictionary with either:
+
+"metadata": { ... } and "body": "<formatted email content>"
+
+OR
+
+"metadata": { ... } and "thread": [ { "metadata": { ... }, "body": "<message 1>" }, { "metadata": { ... }, "body": "<message 2>" }, ... ]
+
+The "metadata" in the main dictionary is the metadata for the overall email (if any), and each thread element can have its own metadata. */
+
+
 import os
 import uvicorn
 import shutil
