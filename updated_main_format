@@ -1,0 +1,165 @@
+import os
+import uvicorn
+import tempfile
+import logging
+
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# Import custom modules
+from parser import parse_email, parse_analysis_field  # parse_email handles .msg, parse_analysis_field extracts structured answers
+from analyzer import get_system_prompt, invoke_TKD_api      # custom TKD API invocation
+
+# Base directory and archive folder
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ARCHIVE_FOLDER = os.path.join(BASE_DIR, "emails_archive")
+if not os.path.isdir(ARCHIVE_FOLDER):
+    raise FileNotFoundError(f"Archive folder not found: {ARCHIVE_FOLDER}")
+
+# Toolkit/model name and LLM name
+TKD_NAME = os.getenv("TKD_NAME", "EmailMonitor1")
+LLM_NAME = os.getenv("LLM_NAME", "gpt-4")
+
+app = FastAPI(
+    title="Email Compliance Analyzer API",
+    version="1.0"
+)
+
+# ---------------------------
+# Endpoint 1: Analyze via Filename (GET)
+# ---------------------------
+@app.get("/analyze-email")
+async def analyze_email_endpoint(
+    filename: str = Query(..., description=".msg filename to analyze")
+):
+    file_path = os.path.join(ARCHIVE_FOLDER, filename)
+    logger.debug("Full file path: %s", file_path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not filename.lower().endswith(".msg"):
+        raise HTTPException(status_code=400, detail="Only .msg files are supported")
+
+    try:
+        # Parse email and nested attachments
+        email_data = parse_email(file_path)
+        logger.debug("Parsed email data: %s", email_data)
+
+        # Prepare body for analysis
+        email_body = email_data.get("body", "")
+        logger.debug("Email body (first 100 chars): %s...", email_body[:100])
+
+        # Invoke TKD API
+        system_prompt = get_system_prompt()
+        analysis = invoke_TKD_api(TKD_NAME, email_body, system_prompt, LLM_NAME)
+        logger.debug("TKD API returned analysis: %s", analysis)
+
+        # Extract structured fields
+        parsed = parse_analysis_field(analysis)
+
+        # Assemble result
+        result = {
+            "metadata": email_data.get("metadata", {}),
+            "classification": parsed.get("classification"),
+            "category": parsed.get("category"),
+            "explanation": parsed.get("explanation"),
+            "context": analysis.get("context")
+        }
+        logger.debug("Assembled result: %s", result)
+    except Exception as exc:
+        logger.error("Error in /analyze-email: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return JSONResponse(content=result)
+
+# ---------------------------
+# Endpoint 2: Analyze via Text Input (POST)
+# ---------------------------
+class TextAnalysisRequest(BaseModel):
+    text_input: str
+
+@app.post("/analyze-text")
+async def analyze_text_endpoint(request: TextAnalysisRequest):
+    text_input = request.text_input
+    logger.debug("Received text input (first 100 chars): %s...", text_input[:100])
+    if not text_input.strip():
+        raise HTTPException(status_code=400, detail="Text input is empty.")
+
+    try:
+        system_prompt = get_system_prompt()
+        analysis = invoke_TKD_api(TKD_NAME, text_input, system_prompt, LLM_NAME)
+        logger.debug("TKD API returned analysis: %s", analysis)
+
+        parsed = parse_analysis_field(analysis)
+
+        result = {
+            "classification": parsed.get("classification"),
+            "category": parsed.get("category"),
+            "explanation": parsed.get("explanation"),
+            "context": analysis.get("context")
+        }
+        logger.debug("Assembled text analysis result: %s", result)
+    except Exception as exc:
+        logger.error("Error in /analyze-text: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return JSONResponse(content=result)
+
+# ---------------------------
+# Endpoint 3: Analyze via File Upload (POST)
+# ---------------------------
+@app.post("/analyze-file")
+async def analyze_file_endpoint(file: UploadFile = File(..., description="Upload .msg file for analysis")):
+    if not file.filename.lower().endswith(".msg"):
+        raise HTTPException(status_code=400, detail="Only .msg files are supported")
+
+    temp_path = None
+    try:
+        # Save upload to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.msg') as tmp:
+            temp_path = tmp.name
+            tmp.write(await file.read())
+        logger.debug("Saved upload to: %s", temp_path)
+
+        # Parse and analyze
+        email_data = parse_email(temp_path)
+        email_body = email_data.get("body", "")
+        logger.debug("Email body (first 100 chars): %s...", email_body[:100])
+
+        system_prompt = get_system_prompt()
+        analysis = invoke_TKD_api(TKD_NAME, email_body, system_prompt, LLM_NAME)
+        logger.debug("TKD API returned analysis: %s", analysis)
+
+        parsed = parse_analysis_field(analysis)
+
+        result = {
+            "metadata": email_data.get("metadata", {}),
+            "classification": parsed.get("classification"),
+            "category": parsed.get("category"),
+            "explanation": parsed.get("explanation"),
+            "context": analysis.get("context")
+        }
+        logger.debug("Assembled file upload result: %s", result)
+    except Exception as exc:
+        logger.error("Error in /analyze-file: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+                logger.debug("Removed temp file: %s", temp_path)
+            except Exception as rm_exc:
+                logger.error("Error removing temp file: %s", rm_exc)
+
+    return JSONResponse(content=result)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
