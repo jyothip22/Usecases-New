@@ -1,93 +1,254 @@
+import re
 import os
-import uvicorn
+import shutil
 import tempfile
+import extract_msg
 import logging
-rom fastapi import FastAPI, HTTPException, Query, File, UploadFile
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import datetime
+import json
+from PyPDF2 import PdfReader  # pip install PyPDF2
+from docx import Document      # pip install python-docx
+from pptx import Presentation  # pip install python-pptx
+from openpyxl import load_workbook # pip install openpyxl
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# Module-level logger
 logger = logging.getLogger(__name__)
 
-# Import custom modules
-from parser import parse_email, parse_analysis_field, safe_json_load  # parser handles .msg & PDF attachments
-from analyzer import get_system_prompt, invoke_TKD_api                    # custom LLM/TKD API invocation
 
-# Base path to stored emails
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ARCHIVE_FOLDER = os.path.join(BASE_DIR, "emails_archive")
-if not os.path.isdir(ARCHIVE_FOLDER):
-    raise FileNotFoundError(f"Archive folder not found: {ARCHIVE_FOLDER}")
+def format_email_body(body: str) -> str:
+    """
+    Normalize and clean the email body:
+      - Convert CRLF/CR to LF
+      - Collapse multiple spaces/tabs
+      - Collapse multiple blank lines
+      - Trim leading/trailing whitespace
+    """
+    logger.debug("Formatting email body (raw length=%d)", len(body))
+    body = body.replace('\r\n', '\n').replace('\r', '\n')
+    body = re.sub(r'[ \t]+', ' ', body)
+    body = re.sub(r'\n\s*\n', '\n\n', body)
+    formatted = body.strip()
+    logger.debug("Formatted email body (length=%d)", len(formatted))
+    return formatted
 
-# Toolkit & model names
-tkd_name = os.getenv("TKD_NAME", "EmailMonitor1")
-llm_name = os.getenv("LLM_NAME", "gpt-4")
 
-app = FastAPI(
-    title="Email Compliance Analyzer API",
-    version="1.0"
-)
-
-# ---------------------------
-# Endpoint: Analyze via Filename (GET)
-# ---------------------------
-@app.get("/analyze-email")
-async def analyze_email_endpoint(
-    filename: str = Query(..., description=".msg filename to analyze")
-):
-    file_path = os.path.join(ARCHIVE_FOLDER, filename)
-    logger.debug("Analyzing file: %s", file_path)
-    if not os.path.exists(file_path):
-        raise HTTPException(404, "File not found")
-    if not filename.lower().endswith('.msg'):
-        raise HTTPException(400, "Only .msg files supported")
-
+def safe_json_load(raw):
+    """Try loading a string into JSON; fallback to original string"""
     try:
-        email_data = parse_email(file_path)
-        logger.debug("Parsed email_data: %s", email_data)
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug("safe_json_load failed: %s", e)
+        return raw
 
-        # Combine body + PDF content for analysis
-        combined_body = email_data.get('body', '')
-        for pdf in email_data.get('pdf_attachments', []):
-            combined_body += f"\n\nAttachment: {pdf['filename']}\n{pdf['content']}"
-        logger.debug("Combined analysis input length: %d", len(combined_body))
 
-        # Invoke TKD API
-        prompt = get_system_prompt()
-        raw = invoke_TKD_api(tkd_name, combined_body, prompt, llm_name)
-        analysis = safe_json_load(raw)
-        if not isinstance(analysis, dict):
-            raise ValueError("Invalid JSON from TKD API")
-        parsed = parse_analysis_field(analysis)
+def parse_analysis_field(data: dict) -> dict:
+    """
+    Extract structured info from 'answer' field:
+      - Matches 'Key: value' pairs separated by newlines
+      - Normalizes keys to lowercase with underscores
+    """
+    answer = data.get('answer')
+    if not isinstance(answer, str):
+        return {}
 
-        # Build response
-        result = {
-            'metadata':      email_data.get('metadata', {}),
-            'classification': parsed.get('classification'),
-            'category':       parsed.get('category'),
-            'explanation':    parsed.get('explanation'),
-            'context':        analysis.get('context')
+    matches = re.findall(r"([\w\s]+):\s*(.*?)(?=\n[\w\s]+:|$)", answer, re.DOTALL)
+    parsed = {}
+    for key, value in matches:
+        key_clean = key.strip().lower().replace(' ', '_')
+        parsed[key_clean] = value.strip()
+        logger.debug("Parsed field '%s': '%s'", key_clean, parsed[key_clean])
+    return parsed
+
+
+def extract_pdf_text(pdf_path: str) -> str:
+    """Extract text from a PDF file"""
+    logger.debug("Extracting text from PDF: %s", pdf_path)
+    reader = PdfReader(pdf_path)
+    texts = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            texts.append(text)
+    combined = "\n".join(texts).strip()
+    logger.debug("Extracted PDF text length=%d", len(combined))
+    return combined
+
+
+def extract_docx_text(docx_path: str) -> str:
+    """Extract text from a .docx Word document"""
+    logger.debug("Extracting text from DOCX: %s", docx_path)
+    doc = Document(docx_path)
+    paragraphs = [para.text for para in doc.paragraphs if para.text]
+    combined = "\n".join(paragraphs).strip()
+    logger.debug("Extracted DOCX text length=%d", len(combined))
+    return combined
+
+
+def extract_pptx_text(pptx_path: str) -> str:
+    """Extract text from a .pptx PowerPoint presentation"""
+    logger.debug("Extracting text from PPTX: %s", pptx_path)
+    prs = Presentation(pptx_path)
+    texts = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                text = shape.text.strip()
+                if text:
+                    texts.append(text)
+    combined = "\n".join(texts).strip()
+    logger.debug("Extracted PPTX text length=%d", len(combined))
+    return combined
+
+
+def extract_excel_text(xlsx_path: str) -> str:
+    """Extract text from an Excel workbook (.xlsx) by reading all cells"""
+    logger.debug("Extracting text from Excel: %s", xlsx_path)
+    wb = load_workbook(xlsx_path, read_only=True)
+    texts = []
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows(values_only=True):
+            row_text = [str(cell) for cell in row if cell is not None]
+            if row_text:
+                texts.append("\t".join(row_text))
+    combined = "\n".join(texts).strip()
+    logger.debug("Extracted Excel text length=%d", len(combined))
+    return combined
+
+
+def parse_msg(file_path: str) -> dict:
+    """
+    Parse a .msg file:
+      1) Extract metadata and format the main body.
+      2) Detect embedded attachments (MSG, PDF, DOCX, PPTX, XLSX), extract text.
+      3) Return dict with metadata, body, pdf_attachments, other attachments, nested_emails.
+    """
+    logger.debug("Starting parse_msg for file: %s", file_path)
+    msg = extract_msg.Message(file_path)
+    try:
+        # Metadata
+        metadata = {
+            "From": msg.sender,
+            "To": msg.to,
+            "Cc": msg.cc,
+            "Bcc": "",
+            "Date": msg.date
         }
-        if 'pdf_attachments' in email_data:
-            result['pdf_attachments'] = email_data['pdf_attachments']
-        if 'nested_emails' in email_data:
-            result['nested_emails'] = email_data['nested_emails']
+        # Date normalization
+        date_val = metadata["Date"]
+        if isinstance(date_val, datetime.datetime):
+            metadata["Date"] = date_val.isoformat()
+        else:
+            metadata["Date"] = str(date_val)
 
-        logger.debug("Assembled result: %s", result)
-    except Exception as e:
-        logger.error("Error in analyze-email: %s", e)
-        raise HTTPException(500, str(e))
+        # Body
+        raw_body = msg.body or getattr(msg, "htmlBody", "") or ""
+        body = format_email_body(raw_body) if raw_body else ""
 
-    return JSONResponse(content=result)
+        result = {"metadata": metadata, "body": body}
+        attachments = msg.attachments or []
+        logger.debug("Total attachments found: %d", len(attachments))
 
-# ---------------------------
-# Other endpoints (analyze-text, analyze-file) would follow similar pattern,
-# ensuring PDF content is appended and returned appropriately.
+        # Lists to collect extracted contents
+        pdf_list = []
+        docx_list = []
+        pptx_list = []
+        xlsx_list = []
+        nested_list = []
 
-if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=8000, log_level='info')
+        for att in attachments:
+            filename = att.getFilename() or ""
+            logger.debug("Inspecting attachment: %s", filename)
+
+            # PDF
+            if filename.lower().endswith('.pdf'):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmpf:
+                    tmpf.write(att.data)
+                    tmp_pdf = tmpf.name
+                try:
+                    text = extract_pdf_text(tmp_pdf)
+                    pdf_list.append({"filename": filename, "content": text})
+                except Exception as e:
+                    logger.error("Error extracting PDF %s: %s", filename, e)
+                finally:
+                    os.remove(tmp_pdf)
+
+            # DOCX
+            elif filename.lower().endswith('.docx'):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmpf:
+                    tmpf.write(att.data)
+                    tmp_docx = tmpf.name
+                try:
+                    text = extract_docx_text(tmp_docx)
+                    docx_list.append({"filename": filename, "content": text})
+                except Exception as e:
+                    logger.error("Error extracting DOCX %s: %s", filename, e)
+                finally:
+                    os.remove(tmp_docx)
+
+            # PPTX
+            elif filename.lower().endswith('.pptx'):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmpf:
+                    tmpf.write(att.data)
+                    tmp_pptx = tmpf.name
+                try:
+                    text = extract_pptx_text(tmp_pptx)
+                    pptx_list.append({"filename": filename, "content": text})
+                except Exception as e:
+                    logger.error("Error extracting PPTX %s: %s", filename, e)
+                finally:
+                    os.remove(tmp_pptx)
+
+            # XLSX
+            elif filename.lower().endswith(('.xlsx', '.xls')):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmpf:
+                    tmpf.write(att.data)
+                    tmp_xlsx = tmpf.name
+                try:
+                    text = extract_excel_text(tmp_xlsx)
+                    xlsx_list.append({"filename": filename, "content": text})
+                except Exception as e:
+                    logger.error("Error extracting Excel %s: %s", filename, e)
+                finally:
+                    os.remove(tmp_xlsx)
+
+            # Nested MSG
+            elif filename.lower().endswith('.msg'):
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    save_type, paths = att.save(customPath=tmpdir, extractEmbedded=True)
+                    if isinstance(paths, str):
+                        paths = [paths]
+                    for p in paths:
+                        nested_data = parse_msg(p)
+                        nested_list.append(nested_data)
+                except Exception as e:
+                    logger.error("Error handling nested .msg %s: %s", filename, e)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if pdf_list:
+            result['pdf_attachments'] = pdf_list
+        if docx_list:
+            result['docx_attachments'] = docx_list
+        if pptx_list:
+            result['pptx_attachments'] = pptx_list
+        if xlsx_list:
+            result['excel_attachments'] = xlsx_list
+        if nested_list:
+            result['nested_emails'] = nested_list
+
+        return result
+
+    finally:
+        try:
+            msg.close()
+        except:
+            pass
+
+def parse_email(file_path: str) -> dict:
+    logger.debug("In parse_email with file: %s", file_path)
+    if file_path.lower().endswith('.msg'):
+        return parse_msg(file_path)
+    error_msg = "Unsupported file format. Only .msg files are supported."
+    logger.error(error_msg)
+    raise ValueError(error_msg)
