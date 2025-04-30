@@ -39,3 +39,7 @@ Use the provided internal policy documents as your source of truth. Whenever you
 *(none for brevity)*
 
 **Expected Output**  
+Classification: Suspicious activity detected
+Category: Rumors & Secrets
+Explanation: “Don’t spread this, but there is a rumor circulating about us negotiating with a bank.” indicates unauthorized disclosure of confidential negotiations.
+Citation: Document: "Insider Trading Policy", Section: "3.1 Confidential Information Handling"
