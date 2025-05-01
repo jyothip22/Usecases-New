@@ -1,0 +1,142 @@
+import os
+import uvicorn
+import tempfile
+import logging
+
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# Import custom modules
+from parser import (
+    parse_email,
+    parse_analysis_field,
+    safe_json_load
+)
+from analyzer import get_system_prompt, invoke_TKD_api
+
+# Base path to stored emails
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ARCHIVE_FOLDER = os.path.join(BASE_DIR, "emails_archive")
+if not os.path.isdir(ARCHIVE_FOLDER):
+    raise FileNotFoundError(f"Archive folder not found: {ARCHIVE_FOLDER}")
+
+# Toolkit & model names
+TKD_NAME = os.getenv("TKD_NAME", "EmailMonitor1")
+LLM_NAME = os.getenv("LLM_NAME", "gpt-4")
+
+app = FastAPI(
+    title="Email Compliance Analyzer API",
+    version="1.0"
+)
+
+def collect_nested_bodies(nested_emails: list) -> str:
+    bodies = []
+    for i, email in enumerate(nested_emails, 1):
+        body = email.get('body', '')
+        bodies.append(f"\n\n--- NESTED EMAIL #{i} ---\n{body}")
+        if 'nested_emails' in email:
+            bodies.append(collect_nested_bodies(email['nested_emails']))
+    return "\n".join(bodies)
+
+@app.get("/analyze-email")
+async def analyze_email_endpoint(
+    filename: str = Query(..., description=".msg filename to analyze")
+):
+    file_path = os.path.join(ARCHIVE_FOLDER, filename)
+    logger.debug("Analyzing file: %s", file_path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not filename.lower().endswith('.msg'):
+        raise HTTPException(status_code=400, detail="Only .msg files supported")
+
+    try:
+        email_data = parse_email(file_path)
+        logger.debug("Parsed email_data: %s", email_data)
+
+        combined_body = email_data.get('body', '')
+        if email_data.get('nested_emails'):
+            combined_body += collect_nested_bodies(email_data['nested_emails'])
+
+        for key, label in [
+            ('pdf_attachments', 'PDF'),
+            ('docx_attachments', 'DOCX'),
+            ('pptx_attachments', 'PPTX'),
+            ('excel_attachments', 'Excel')
+        ]:
+            for att in email_data.get(key, []):
+                combined_body += f"\n\nAttachment ({label}): {att['filename']}\n{att['content']}"
+        logger.debug("Combined analysis input length: %d", len(combined_body))
+
+        system_prompt = get_system_prompt()
+        raw = invoke_TKD_api(TKD_NAME, combined_body, system_prompt, LLM_NAME)
+        analysis = safe_json_load(raw)
+        if not isinstance(analysis, dict):
+            raise ValueError("Invalid JSON from TKD API")
+
+        parsed = parse_analysis_field(analysis)
+        citation = parsed.get('citation')
+
+        result = {
+            'metadata'      : email_data.get('metadata', {}),
+            'classification': parsed.get('classification'),
+            'category'      : parsed.get('category'),
+            'explanation'   : parsed.get('explanation'),
+            'citation'      : citation,
+            'context'       : analysis.get('context')
+        }
+        for key in ('pdf_attachments','docx_attachments','pptx_attachments','excel_attachments','nested_emails'):
+            if key in email_data:
+                result[key] = email_data[key]
+
+        logger.debug("Assembled result: %s", result)
+    except Exception as e:
+        logger.error("Error in /analyze-email: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return JSONResponse(content=result)
+
+class TextAnalysisRequest(BaseModel):
+    text_input: str
+
+@app.post("/analyze-text")
+async def analyze_text_endpoint(request: TextAnalysisRequest):
+    text_input = request.text_input
+    logger.debug("Received text input (first 100 chars): %s...", text_input[:100])
+    if not text_input.strip():
+        raise HTTPException(status_code=400, detail="Text input is empty.")
+
+    try:
+        system_prompt = get_system_prompt()
+        raw = invoke_TKD_api(TKD_NAME, text_input, system_prompt, LLM_NAME)
+        analysis = safe_json_load(raw)
+        if not isinstance(analysis, dict):
+            raise ValueError("Invalid JSON from TKD API")
+
+        parsed = parse_analysis_field(analysis)
+        citation = parsed.get('citation')
+
+        result = {
+            'classification': parsed.get('classification'),
+            'category'      : parsed.get('category'),
+            'explanation'   : parsed.get('explanation'),
+            'citation'      : citation,
+            'context'       : analysis.get('context')
+        }
+        logger.debug("Assembled text result: %s", result)
+    except Exception as e:
+        logger.error("Error in /analyze-text: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return JSONResponse(content=result)
+
+if __name__ == '__main__':
+    uvicorn.run(app, host='0.0.0.0', port=8000, log_level='info')
