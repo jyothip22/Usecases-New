@@ -1,0 +1,5 @@
+numbered_matches = re.findall(
+    r"\d+\.\s*(Classification|Category|Explanation|Citation(?:\\s*\\(required\\))?):\s*(.*?)(?=(?:\n\d+\.|$))",
+    answer,
+    re.DOTALL
+)
