@@ -1,0 +1,10 @@
+At the end of your analysis, always return your result in the following exact JSON format, with no extra explanation or text outside the JSON block:
+
+{
+  "classification": "<'Suspicious activity detected' or 'No suspicious activity detected'>",
+  "category": "<One of: 'Front Running', 'Rumors & Secrets', 'Outside Business Activity', 'Gifts & Entertainment', 'Inappropriate Use of Discretion', 'Customer Complaints', 'Guarantees & Assurances', or 'None'>",
+  "explanation": "<Explanation of why the content is (or is not) suspicious. Be concise. Do not include citation here.>",
+  "citation": "<Document: '...', Section: '...'> or 'None' if no issue found"
+}
+
+Do not include any Markdown, numbering, or commentary. Only return the JSON object exactly as shown above.
