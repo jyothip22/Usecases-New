@@ -1,0 +1,20 @@
+{
+  "document_summary": "This document provides some sample communications excerpt along with explanations to identify the relevant category applicable.",
+  "categories": [
+    {
+      "category": "Rumors and Secrets",
+      "sample_statement": "There is a rumor we are negotiating with LMN holdings - nothing confirmed yet",
+      "explanation": "Refer to potential deals or market-moving news, even if unconfirmed. Sharing such rumors can lead to market manipulation or selective disclosure. May breach internal policies on information control."
+    },
+    {
+      "category": "Guarantees and Assurances",
+      "sample_statement": "Deal is a slam dunk, should make killing’",
+      "explanation": "This message implies certainity about the outcome of a financial deal, which may misled clients or reflect inappropriate communication."
+    },
+    {
+      "category": "Front Running",
+      "sample_statement": "Our firm is advising on a confidential takeover of JKL company. If you get in now, there’s likely a big upside.",
+      "explanation": "The message discloses confidential information about a take over involving JKL company, and encourages someone to act on it before the information goes public."
+    }
+  ]
+}
